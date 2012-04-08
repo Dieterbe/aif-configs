@@ -1,0 +1,113 @@
+# This is how dieter sets up this Lenovo Thinkpad t420s With Intel 160GB SSD, using archiso
+# it leverages AIF's filesystem code, but aif does not support grub2,efi,gpt yet so we do that here.
+# originally based on https://bbs.archlinux.org/viewtopic.php?id=129885, most specifically the fork
+# https://github.com/Dieterbe/arch-by-hand/tree/dieter-t420s
+# uses archiso (boot it over EFI, otherwise the efibootmgr command won't work)
+# uses gpt,efi,grub2 and an lvm-over-dm_crypt setup
+# alignments should be okay and discard/trim commands should go down the entire DM stack.
+# TODO: (after install), add options 'noatime,discard' to the ext4's in fstab.
+
+if [ -d /repo/core ]; then
+    # you're not supposed to mix old core snapshot with current extra, but i don't see any problems for now, this goes faster.
+    # we need extra for grub2
+    TARGET_REPOSITORIES=(core 'file:///repo/$repo/$arch' extra 'ftp://mirrors.kernel.org/archlinux/$repo/os/$arch')
+else
+    MIRROR='ftp://mirrors.kernel.org/archlinux/$repo/os/$arch'
+    TARGET_REPOSITORIES=(core $var_MIRRORLIST extra $var_MIRRORLIST)
+fi
+
+ssd_dev=$(fdisk -l 2>/dev/null | grep -F '160.0 GB' | cut -d' ' -f2 | sed 's/:$//')
+
+RUNTIME_REPOSITORIES=
+RUNTIME_PACKAGES='grub2-efi-x86_64 gptfdisk'
+TARGET_GROUPS=base
+TARGET_PACKAGES_EXCLUDE='reiserfsprogs grub'
+TARGET_PACKAGES='openssh e2fsprogs cryptsetup lvm2 grub2-efi-x86_64 xfsprogs htop git vim zsh sudo'
+
+# handy functions taken from arch-by-hand
+SetValue () {
+	# EXAMPLE: SetValue VARIABLENAME '\"Quoted Value\"' /file/path
+	VALUENAME="$1" NEWVALUE="$2" FILEPATH="$3"
+	sed -i "s+^#\?\(${VALUENAME}\)=.*$+\1=${NEWVALUE}+" "${FILEPATH}"
+}
+
+CommentOutValue () {
+	VALUENAME="$1" FILEPATH="$2"
+	sed -i "s/^\(${VALUENAME}.*\)$/#\1/" "${FILEPATH}"
+}
+
+UncommentValue () {
+	VALUENAME="$1" FILEPATH="$2"
+	sed -i "s/^#\(${VALUENAME}.*\)$/\1/" "${FILEPATH}"
+}
+
+worker_intro () {
+	inform "Installing to $ssd_dev .. You have 10 seconds to press Ctrl-C"
+	sleep 10
+}
+
+worker_sysprep () {
+        mount -o remount,rw / &>/dev/null
+	modprobe efivars
+	modprobe dm-mod
+	pacman -Rsdd --noconfirm grub # avoid conflicts with grub2, note that grub is marked as dep for aif
+}
+
+worker_runtime_network () {
+	dhcpcd -k eth0 2>/dev/null
+	dhcpcd eth0
+}
+
+worker_configure_system () {
+	preconfigure_target
+	sed -i 's/^HOSTNAME="myhost"/HOSTNAME="dieter-t420s"/' $var_TARGET_DIR/etc/rc.conf
+	SetValue MODULES '\"dm_mod dm_crypt aes_x86_64 ext2 ext4 vfat intel_agp drm i915\"' $var_TARGET_DIR/etc/mkinitcpio.conf
+	SetValue HOOKS '\"base udev pata scsi sata usb usbinput keymap consolefont encrypt lvm2 filesystems fsck\"' $var_TARGET_DIR/etc/mkinitcpio.conf
+	SetValue KEYMAP 'dvorak' $var_TARGET_DIR/etc/rc.conf
+	postconfigure_target
+}
+
+process_disks () {
+	sgdisk -Z $ssd_dev # zap all on disk
+	sgdisk -a 2048 -o $ssd_dev # new gpt disk 2048 alignment
+
+	# create partitions
+	sgdisk -n 1:0:+200M $ssd_dev # partition 1 (UEFI SYS), default start block, 200MB
+	sgdisk -n 2:0:+200M $ssd_dev # partition 2 (BOOT), default start block, 200MB
+	sgdisk -n 3:0:0 $ssd_dev # partition 3, (LUKS), default start, remaining space
+
+	# set partition types
+	sgdisk -t 1:ef00 $ssd_dev
+	sgdisk -t 2:8300 $ssd_dev
+	sgdisk -t 3:8300 $ssd_dev
+
+	# label partitions
+	sgdisk -c 1:"UEFI System" $ssd_dev
+	sgdisk -c 2:"Boot" $ssd_dev
+	sgdisk -c 3:"LUKS" $ssd_dev
+}
+
+worker_install_bootloader () {
+	mkdir -p $var_TARGET_DIR/boot/efi/EFI || return 1
+	SetValue GRUB_CMDLINE_LINUX '\"root=/dev/mapper/cryptpool-root cryptdevice=/dev/sda3:sda3crypt:allow-discards ro add_efi_memmap i915.modeset=1 i915.i915_enable_rc6=1 i915.i915_enable_fbc=1 i915.lvds_downclock=1 pcie_aspm=force quiet\"' $var_TARGET_DIR/etc/default/grub
+	SetValue GRUB_TERMINAL_OUTPUT gfxterm $var_TARGET_DIR/etc/default/grub
+	SetValue GRUB_GFXMODE 960x600x32,auto $var_TARGET_DIR/etc/default/grub
+	SetValue GRUB_GFXPAYLOAD_LINUX keep $var_TARGET_DIR/etc/default/grub
+	target_special_fs on
+	chroot $var_TARGET_DIR grub-install --directory=/usr/lib/grub/x86_64-efi --root-directory=/boot/efi --target=x86_64-efi --boot-directory=/boot --bootloader-id=arch_grub --no-floppy --recheck &>/boot/grub.log || return 1
+	chroot $var_TARGET_DIR efibootmgr --create --gpt --disk $ssd_dev --part 1 --write-signature --label "ARCH LINUX (GRUB2)" --loader "\\\\EFI\\\\arch_grub\\\\grubx64.efi" || return 1
+	chroot $var_TARGET_DIR grub-mkconfig -o /boot/grub/grub.cfg || return 1
+	target_special_fs off
+}
+
+PARTITIONS="thismustbesetbutwontbeused"
+GRUB_DEVICE=$ssd_dev
+BLOCKDATA="${ssd_dev}1 raw no_label vfat;yes;/boot/efi;target;no_opts;no_label;-F32
+${ssd_dev}2 raw no_label ext3;yes;/boot;target;no_opts;no_label;no_params
+${ssd_dev}3 raw no_label dm_crypt;yes;no_mountpoint;target;no_opts;sda3crypt;-c__aes-xts-plain__-y__-s__512__
+/dev/mapper/sda3crypt dm_crypt no_label lvm-pv;yes;no_mountpoint;target;no_opts;no_label;no_params
+/dev/mapper/sda3crypt+ lvm-pv no_label lvm-vg;yes;no_mountpoint;target;no_opts;cryptpool;/dev/mapper/sda3crypt
+/dev/mapper/cryptpool lvm-vg cryptpool lvm-lv;yes;no_mountpoint;target;no_opts;root;15G|lvm-lv;yes;no_mountpoint;target;no_opts;home;15G|lvm-lv;yes;no_mountpoint;target;no_opts;var;5G
+/dev/mapper/cryptpool-root lvm-lv no_label ext4;yes;/;target;no_opts;no_label;no_params
+/dev/mapper/cryptpool-home lvm-lv no_label ext4;yes;/home;target;no_opts;no_label;no_params
+/dev/mapper/cryptpool-var lvm-lv no_label ext4;yes;/var;target;no_opts;no_label;no_params"
